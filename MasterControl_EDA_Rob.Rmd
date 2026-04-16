@@ -1,0 +1,455 @@
+---
+title: "MasterControl QAL Analysis - EDA"
+author: "Rob Sheehy"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+# Business Context
+
+MasterControl wants to improve their Mx (Manufacturing) product performance. Right now Mx converts at 12.7% while Qx (Quality) converts at 19.7%. The goal is to figure out which industries, company sizes, and buyer personas actually convert for Mx so they can focus their outbound efforts better.
+
+My focus for this individual EDA: [Pick one - Mx deep dive / Title patterns / Missing data / Segment identification]
+
+---
+
+# Chunk 1: Load and Basic Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(knitr)
+
+# Load data
+df <- read_csv("QAL Performance for MSBA.csv", show_col_types = FALSE)
+
+# Quick check
+cat("Loaded", nrow(df), "leads from", 
+    min(df$`qal cohort date`), "to", max(df$`qal cohort date`), "\n")
+```
+
+**Notes - Initial Load**
+
+Data looks clean on import. Need to check for:
+- Missing values (I know there's ~40% missing on some fields)
+- How the outcome variable is coded
+- Whether dates parsed correctly
+
+---
+
+# Chunk 2: Target Variable Check
+
+```{r target-check}
+# What outcomes do we have?
+outcome_counts <- df %>%
+  count(`next_stage__c`, name = "n") %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n))
+
+kable(outcome_counts, caption = "Lead Outcomes Distribution")
+
+# Calculate baseline SQL conversion
+baseline <- df %>%
+  summarise(
+    total = n(),
+    sql = sum(`next_stage__c` == "SQL", na.rm = TRUE),
+    rate = round(sql / total * 100, 2)
+  )
+
+cat("\nBaseline SQL conversion rate:", baseline$rate, "%\n")
+```
+
+**Notes - Target Variable**
+
+Key findings:
+- 71.8% of leads are Recycled - that's the majority outcome
+- Only 16.2% make it to SQL 
+- Just 42 Won deals (0.2%)
+
+Baseline SQL conversion rate: 16.16%
+
+This tells me most leads don't progress, which aligns with MasterControl's "change is hard" objection. The 12.7% Mx rate is about 3.5 percentage points below baseline - a 20%+ relative gap. Need to find where Mx performs at or above this 16% mark.
+
+Also 2.9% have missing outcomes - will exclude those since I can't classify them.
+
+---
+
+# Chunk 3: Missing Data Assessment
+
+```{r missing-data}
+# Calculate missingness
+missing_summary <- df %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(
+    total = nrow(df),
+    pct_missing = round(100 * n_missing / total, 1)
+  ) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(pct_missing))
+
+kable(missing_summary, caption = "Fields with Missing Data")
+
+# Visualize
+missing_summary %>%
+  ggplot(aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Missing Data by Field",
+       x = "Field", y = "% Missing") +
+  geom_text(aes(label = paste0(pct_missing, "%")), hjust = -0.1, size = 3)
+```
+
+**Notes - Missing Data Challenge**
+
+The big issue: 40.9% missing for manufacturing model and site function. That's almost half the dataset - AI web scraping (Tably AI) failed on these fields.
+
+Also 38.1% missing job titles.
+
+**What this means:**
+
+Any segmentation by manufacturing model or site function only covers 59% of the data. Need to decide: exclude the missing 41%, create "Unknown" category, or try to impute?
+
+For now keeping them but will flag when missingness is high. Need to check if missing data is random or patterned - tells me if it's safe to exclude.
+
+Good news: industry (0.3% missing), tier (0.3%), and territory (0.8%) are nearly complete. Can do basic segmentation with those.
+
+**Bottom line:** This 40% missing will limit my manufacturing model analysis throughout the EDA.
+
+---
+
+# Chunk 4: Product Performance - The Core Problem
+
+```{r mx-qx-comparison}
+# Classify leads into Mx, Qx, Other
+df_classified <- df %>%
+  mutate(
+    product_group = case_when(
+      solution %in% c("Mx", "Manufacturing") ~ "Mx",
+      solution %in% c("Qx", "Quality") ~ "Qx",
+      TRUE ~ "Other"
+    )
+  )
+
+# Calculate conversion by product
+product_perf <- df_classified %>%
+  filter(product_group %in% c("Mx", "Qx")) %>%
+  group_by(product_group) %>%
+  summarise(
+    total = n(),
+    sql = sum(`next_stage__c` == "SQL", na.rm = TRUE),
+    rate = round(sql / total * 100, 2),
+    recycled = sum(`next_stage__c` == "Recycled", na.rm = TRUE),
+    recycled_pct = round(100 * recycled / total, 1)
+  )
+
+kable(product_perf, caption = "Mx vs Qx Performance")
+
+# Plot it
+product_perf %>%
+  ggplot(aes(x = product_group, y = rate, fill = product_group)) +
+  geom_col() +
+  geom_hline(yintercept = baseline$rate, linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste0(rate, "%")), vjust = -0.5) +
+  labs(title = "SQL Conversion: Mx vs Qx",
+       subtitle = "Red line = Overall baseline (18%)",
+       x = NULL, y = "SQL Conversion Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Notes - Confirming the Mx Problem**
+
+Numbers confirm the gap:
+- Mx: 11.12% conversion ← Problem
+- Qx: 17.38% conversion ← Above baseline
+- Gap: 6.3 percentage points
+
+Also notice Mx has higher recycled rate (76.7%) vs Qx (70.7%). So Mx leads are more likely to drop off without progressing.
+
+The chart makes it clear - Qx is basically at baseline (18%), but Mx is significantly below at 11.12%.
+
+**Key question:** WHERE does Mx actually perform well? There must be some segments where it works. Need to find those and figure out what's common.
+
+Even getting Mx to 14-15% would be a meaningful improvement - that's a 25-35% relative increase in conversion. The gap looks fixable if I can identify the right target segments.
+---
+
+# [YOUR FOCUS AREA STARTS HERE]
+
+## Option A: If focusing on Mx Deep Dive
+
+# Chunk 5: Mx Performance by Industry
+
+```{r mx-by-industry}
+# Look at Mx performance across industries
+mx_industry <- df_classified %>%
+  filter(product_group == "Mx", !is.na(`acct target industry`)) %>%
+  group_by(`acct target industry`) %>%
+  summarise(
+    total = n(),
+    sql = sum(`next_stage__c` == "SQL", na.rm = TRUE),
+    rate = round(100 * sql / total, 1)
+  ) %>%
+  filter(total >= 20) %>%  # Need minimum sample
+  arrange(desc(rate))
+
+kable(head(mx_industry, 15), 
+      caption = "Top 15 Industries for Mx Conversion (min 20 leads)")
+
+# Visualize top 10
+mx_industry %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(`acct target industry`, rate), y = rate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  geom_hline(yintercept = 12.7, linetype = "dashed", color = "red") +
+  labs(title = "Where Mx Actually Works (Top 10 Industries)",
+       subtitle = "Red line = Mx baseline (12.7%)",
+       x = NULL, y = "SQL Conversion Rate (%)")
+```
+
+**Notes - Mx Winners and Losers**
+
+Looking at where Mx actually performs:
+- Blood & Biologics: 15.5% - best performer, above the 12.7% baseline
+- Medical Device: 13.4% - also above baseline
+- Pharma & BioTech: 10.4% - below baseline despite being the largest volume (1,758 leads)
+- Non-Life Science: 10.4% - also underperforming
+
+**Interesting pattern:** The top two performers (Blood & Biologics, Medical Device) are both in highly regulated manufacturing sectors. Makes sense - they have complex manufacturing operations that need real MES systems.
+
+**Volume consideration:** Blood & Biologics looks great at 15.5% but only has 84 leads total. That's not enough volume for a scalable targeting strategy - remember MasterControl's "better 25% with 1,000 than 50% with 50" principle.
+
+Medical Device is more promising: 861 leads with 13.4% conversion. That's both above baseline AND sufficient volume.
+
+Pharma is disappointing - it's the biggest segment (1,758 leads) but only converts at 10.4%. Either Mx isn't a good fit for pharma companies, or we're targeting the wrong personas within pharma.
+
+**Key takeaway:** Mx isn't universally bad - it works in Medical Device. Just needs better targeting to avoid low-converting segments like Pharma and Non-Life Science.
+---
+
+# Chunk 6: Mx Performance by Company Size
+
+```{r mx-by-tier}
+# First create df_classified (in case it's not in environment)
+df_classified <- df %>%
+  mutate(
+    product_group = case_when(
+      solution %in% c("Mx", "Manufacturing") ~ "Mx",
+      solution %in% c("Qx", "Quality") ~ "Qx",
+      TRUE ~ "Other"
+    )
+  )
+
+# Now analyze Mx by company tier
+mx_tier <- df_classified %>%
+  filter(product_group == "Mx",
+         !is.na(`acct tier rollup`),
+         `acct tier rollup` != "Other") %>%
+  group_by(`acct tier rollup`) %>%
+  summarise(
+    total = n(),
+    sql = sum(`next_stage__c` == "SQL", na.rm = TRUE),
+    rate = round(100 * sql / total, 1)
+  ) %>%
+  arrange(desc(rate))
+
+kable(mx_tier, caption = "Mx Conversion by Company Size")
+
+# Plot
+mx_tier %>%
+  ggplot(aes(x = reorder(`acct tier rollup`, rate), y = rate)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = 12.7, linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste0(rate, "%")), vjust = -0.5) +
+  labs(title = "Mx Conversion by Company Size",
+       x = "Company Tier", y = "SQL Conversion Rate (%)")
+```
+
+**Notes - Company Size Impact**
+
+Surprising finding: **Small companies convert best** for Mx at 15.6% - above the 12.7% baseline.
+- Small: 15.6% (846 leads)
+- Medium: 10.9% (2,281 leads)
+- Large: 5.5% (542 leads)
+
+This is the opposite of what I expected. Figured bigger manufacturers would have more complex operations needing MES software.
+
+**Possible explanations:**
+- Small companies might be more agile, easier to sell to (fewer decision-makers?)
+- Large companies might already have MES systems in place - harder to displace
+- Medium/Large might have more complex buying processes that kill deals
+
+**Volume consideration:** 
+Small companies have both the best conversion (15.6%) AND decent volume (846 leads). Medium has the most volume (2,281) but converts poorly (10.9%).
+
+Using MasterControl's "25% with 1,000 vs 50% with 50" principle: Small companies look like the sweet spot - above-baseline conversion with sufficient volume.
+
+**This changes my thinking:** I assumed we'd want to target Large manufacturers for Mx, but the data says focus on Small companies instead. Need to understand why Large underperforms so badly (5.5% is less than half the baseline).
+
+# Chunk 5: Title Data Quality Check
+
+```{r title-quality}
+title_summary <- df %>%
+  summarise(
+    total = n(),
+    with_title = sum(!is.na(`contact/lead title`)),
+    missing = sum(is.na(`contact/lead title`)),
+    pct_missing = round(100 * missing / total, 1),
+    unique_titles = n_distinct(`contact/lead title`, na.rm = TRUE)
+  )
+
+cat("Title Summary:\n")
+cat("  Total leads:", comma(title_summary$total), "\n")
+cat("  With titles:", comma(title_summary$with_title), "\n")
+cat("  Missing:", comma(title_summary$missing), 
+    paste0("(", title_summary$pct_missing, "%)"), "\n")
+cat("  Unique titles:", comma(title_summary$unique_titles), "\n")
+```
+
+**Notes - Title Challenge**
+
+5,790 unique title variations. That's the problem - no standardization.
+
+38.1% are missing entirely (6,408 records). For the 10,407 that do have titles, need to extract patterns:
+- Seniority (C-Suite, VP, Director, Manager, IC)
+- Function (Quality, Operations, Engineering, Regulatory)
+
+This is going to require keyword matching. Can't manually categorize 5,790 variations.
+
+The missing 38% will limit title-based segmentation - any analysis by job title only covers 62% of leads. Similar issue to the manufacturing model missing data.
+
+**Next step:** Look at most common titles to identify keyword patterns I can use for classification.iuk
+---
+
+# Chunk 6: Most Common Titles
+
+```{r common-titles}
+# Top 30 titles
+top_titles <- df %>%
+  filter(!is.na(`contact/lead title`)) %>%
+  count(`contact/lead title`, sort = TRUE) %>%
+  head(30)
+
+kable(top_titles, caption = "Top 30 Job Titles by Frequency")
+
+# Check for keyword patterns
+keywords <- c("quality", "manager", "director", "engineer", "vp", "president", 
+              "operations", "manufacturing", "regulatory", "senior")
+
+# Count how often each keyword appears
+keyword_counts <- tibble(
+  keyword = keywords,
+  count = map_dbl(keywords, ~sum(str_detect(
+    tolower(df$`contact/lead title`[!is.na(df$`contact/lead title`)]), .x
+  )))
+) %>%
+  arrange(desc(count))
+
+kable(keyword_counts, caption = "Keyword Frequency in Titles")
+```
+
+**Notes - Title Patterns**
+
+Clear patterns emerging from the top 30 titles and keyword analysis:
+
+**Most common titles are Quality-focused:**
+- Quality Manager (252)
+- Manager, Quality (124)
+- Quality Assurance Manager (98)
+- QA Manager (72)
+
+Makes sense given MasterControl's customer base, but this is a problem for Mx - these are Quality personas, not Manufacturing personas.
+
+**Keyword frequency shows I can build a classification system:**
+
+**For Seniority:**
+- manager: 3,119 occurrences
+- director: 1,746
+- senior: 1,082
+- president: 458
+- vp: 89
+
+**For Function:**
+- quality: 3,096 (dominant)
+- operations: 774
+- manufacturing: 477
+- regulatory: 460
+- engineer: 987
+
+**Classification approach:** Build hierarchical logic:
+1. Check for C-Suite keywords (CEO, President, Founder) → C-Suite
+2. Check for VP → VP
+3. Check for Director → Director  
+4. Check for Manager → Manager
+5. Check for Senior → Senior IC
+6. Everything else → IC or Unknown
+
+Similar approach for function - check for quality, operations, manufacturing, regulatory, engineering keywords.
+
+**Key insight:** Quality titles dominate (3,096 "quality" vs 477 "manufacturing"). This explains the Mx problem - we're reaching Quality personas who care about QMS, not Manufacturing personas who need MES.
+
+---
+
+## Option C: Segment Identification
+
+# Chunk 5: Combined Segmentation (Industry × Size × Product)
+
+```{r segment-analysis}
+# Find high-performing combinations
+segments <- df_classified %>%
+  filter(!is.na(`acct target industry`),
+         !is.na(`acct tier rollup`),
+         `acct tier rollup` != "Other",
+         product_group %in% c("Mx", "Qx")) %>%
+  group_by(`acct target industry`, `acct tier rollup`, product_group) %>%
+  summarise(
+    total = n(),
+    sql = sum(`next_stage__c` == "SQL", na.rm = TRUE),
+    rate = round(100 * sql / total, 1),
+    .groups = "drop"
+  ) %>%
+  filter(total >= 30) %>%  # Need statistical confidence
+  arrange(desc(rate))
+
+# Show top 20
+kable(head(segments, 20), 
+      caption = "Top 20 Segments (Industry × Size × Product, min 30 leads)")
+```
+
+**Notes - High-Performing Segments**
+
+Looking at the top combinations:
+
+**Best overall:** Medical Device + Small + Qx converts at 28.9% (804 leads) - way above baseline.
+
+**Best Mx segments:**
+- Medical Device + Small + Mx: 20.3% (192 leads) ← Best Mx performance I've seen
+- Pharma + Small + Mx: 19.0% (326 leads) ← Also strong, decent volume
+
+Pattern is clear: **Small companies are where Mx works.** All the top Mx segments are Small. Medium and Large Mx segments are down in the 9-13% range.
+
+**Interesting finding:** Pharma + Small + Mx converts at 19.0%, but earlier I saw overall Pharma + Mx was only 10.4%. The difference? Company size. Small pharma companies work for Mx, medium/large pharma don't.
+
+**Volume consideration:** 
+- Medical Device + Small + Mx: 20.3% conversion with 192 leads - above baseline, decent volume
+- Pharma + Small + Mx: 19.0% with 326 leads - even better volume
+
+These are actionable segments. Both have sufficient volume (>100 leads) and beat the 12.7% Mx baseline significantly.
+
+**Key takeaway:** Focus Mx outbound on Small companies in Medical Device and Pharma. A
+\void Medium/Large companies - they consistently underperform.
+
+;---
+
+# AI Usage Log
+
+I leveraged AI assistance for coding support and exploratory guidance. The business insights and recommendations reflect my analysis of the findings.
+
+---
+
+**END OF EDA**
