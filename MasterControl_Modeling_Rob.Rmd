@@ -1,0 +1,595 @@
+---
+title: "MasterControl QAL Modeling — Mx Lead Targeting"
+author: "Rob Sheehy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: readable
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: show
+    number_sections: true
+---
+
+```{r install-packages, message=FALSE, warning=FALSE}
+packages <- c(
+  "tidyverse", "lubridate", "janitor", "gt", "scales",
+  "caret", "recipes", "pROC", "yardstick", "randomForest",
+  "xgboost", "broom", "forcats", "rsample", "tibble"
+)
+installed <- rownames(installed.packages())
+to_install <- packages[!packages %in% installed]
+if (length(to_install) > 0) install.packages(to_install)
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(gt)
+library(scales)
+library(caret)
+library(recipes)
+library(pROC)
+library(yardstick)
+library(randomForest)
+library(broom)
+library(forcats)
+library(rsample)
+
+theme_set(theme_minimal())
+set.seed(123)
+```
+
+# Business Context
+
+MasterControl provides enterprise software to regulated life sciences companies through two product lines — Qx for quality management and Mx for manufacturing execution. While Qx converts qualified leads at around 19.7%, Mx significantly underperforms at 12.7%.
+
+My EDA identified the core problem: Mx leads are going to the wrong organizations (non-manufacturing companies) and the wrong people (quality-focused titles rather than manufacturing-focused ones). This modeling notebook builds on that to answer the question — can we predict which Mx leads are most likely to convert, and use that to build a practical targeting framework for the sales team?
+
+**Modeling objective:** Identify the account characteristics and buyer personas that most strongly predict Mx lead progression, and translate those findings into a scored, tiered lead list the sales team can act on immediately.
+
+---
+
+# Data Preparation
+
+## Load and Clean
+
+```{r load-data}
+qal_data <- read_csv("Mastercontrol QAL Performance.csv") %>%
+  clean_names()
+
+cat("Records loaded:", nrow(qal_data), "\n")
+cat("Columns:", ncol(qal_data), "\n")
+```
+
+## Standardize Missing Values
+
+```{r clean-missing}
+qal_model <- qal_data %>%
+  mutate(across(everything(),
+    ~ case_when(
+      . %in% c("Unknown", "Not Enough Info Found", "MISSING/BLANK") ~ NA_character_,
+      TRUE ~ as.character(.)
+    )
+  )) %>%
+  mutate(qal_cohort_date = lubridate::mdy(qal_cohort_date))
+```
+
+## Create Target Variable
+
+A lead progressed if it reached SQL, SQO, or Won — advancement deeper in the funnel, not a closed deal.
+
+```{r target-variable}
+qal_model <- qal_model %>%
+  filter(!is.na(next_stage_c)) %>%
+  mutate(
+    progressed = if_else(
+      next_stage_c %in% c("SQL", "SQO", "Won"), 1, 0
+    )
+  )
+
+qal_model %>%
+  count(progressed) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  gt() %>%
+  tab_header(title = "Target Variable Distribution")
+```
+
+**Notes:** Class imbalance is real — only about 15% of leads progressed. This is handled downstream with class weights in the random forest and threshold tuning from the training ROC curve rather than defaulting to 0.5.
+
+---
+
+# Feature Engineering
+
+## Title Feature Engineering
+
+One of my key EDA findings was that job titles are a strong signal but the raw data has 6,400+ unique title variations. I built a rule-based classification system to convert those into interpretable categories — seniority level and functional role — plus binary keyword flags that capture overlapping signals.
+
+```{r title-features}
+qal_model <- qal_model %>%
+  mutate(
+    title_clean = contact_lead_title %>%
+      str_to_lower() %>%
+      str_replace_all("[^a-z0-9 ]", " ") %>%
+      str_squish(),
+
+    # Seniority classification
+    title_seniority = case_when(
+      is.na(contact_lead_title)  ~ "Missing",
+      str_detect(title_clean, "\\bvp\\b|vice president|svp|evp") ~ "VP",
+      str_detect(title_clean, "\\bchief\\b|\\bceo\\b|\\bcfo\\b|\\bcoo\\b|president|founder|owner") ~ "Executive",
+      str_detect(title_clean, "\\bdirector\\b|\\bhead\\b") ~ "Director",
+      str_detect(title_clean, "\\bmanager\\b|supervisor|team lead") ~ "Manager",
+      str_detect(title_clean, "engineer|scientist|specialist|analyst|coordinator") ~ "Individual_Contributor",
+      TRUE ~ "Other"
+    ),
+
+    # Functional role classification
+    title_function = case_when(
+      is.na(contact_lead_title)  ~ "Missing",
+      str_detect(title_clean, "quality|\\bqa\\b|\\bqc\\b|compliance|validation") ~ "Quality_Compliance",
+      str_detect(title_clean, "regulatory|reg affairs") ~ "Regulatory",
+      str_detect(title_clean, "manufacturing|production|plant|operations") ~ "Manufacturing_Operations",
+      str_detect(title_clean, "engineer|scientist|research|development") ~ "Engineering_RD",
+      str_detect(title_clean, "\\bit\\b|systems|software|digital|technology") ~ "IT_Systems",
+      str_detect(title_clean, "sales|marketing|business development|commercial") ~ "Commercial_Business",
+      str_detect(title_clean, "supply chain|procurement|logistics") ~ "Supply_Chain",
+      TRUE ~ "Other"
+    ),
+
+    # Keyword flags — binary signals that can overlap across titles
+    has_quality       = if_else(!is.na(title_clean) & str_detect(title_clean, "quality|\\bqa\\b|\\bqc\\b|compliance|validation"), 1, 0),
+    has_manufacturing = if_else(!is.na(title_clean) & str_detect(title_clean, "manufacturing|production|plant|process|industrial"), 1, 0),
+    has_operations    = if_else(!is.na(title_clean) & str_detect(title_clean, "operations|operational excellence|continuous improvement"), 1, 0),
+    has_engineering   = if_else(!is.na(title_clean) & str_detect(title_clean, "engineer|engineering|scientist|research|automation"), 1, 0),
+    has_regulatory    = if_else(!is.na(title_clean) & str_detect(title_clean, "regulatory|\\bra\\b|reg affairs"), 1, 0),
+    has_vp            = if_else(!is.na(title_clean) & str_detect(title_clean, "\\bvp\\b|vice president"), 1, 0),
+    has_director      = if_else(!is.na(title_clean) & str_detect(title_clean, "\\bdirector\\b|\\bhead\\b"), 1, 0),
+    has_manager       = if_else(!is.na(title_clean) & str_detect(title_clean, "\\bmanager\\b|supervisor|team lead"), 1, 0)
+  ) %>%
+  mutate(
+    title_seniority = as.factor(title_seniority),
+    title_function  = as.factor(title_function)
+  )
+```
+
+## Prepare Modeling Dataset
+
+```{r prep-model-data}
+model_data <- qal_model %>%
+  mutate(
+    acct_target_industry       = as.factor(acct_target_industry),
+    acct_manufacturing_model   = fct_lump_n(as.factor(acct_manufacturing_model), n = 8),
+    acct_primary_site_function = fct_lump_n(as.factor(acct_primary_site_function), n = 8),
+    acct_tier_rollup           = as.factor(acct_tier_rollup),
+    solution_rollup            = as.factor(solution_rollup),
+    progressed                 = factor(progressed, levels = c(0, 1))
+  ) %>%
+  select(
+    progressed,
+    solution_rollup,
+    acct_target_industry,
+    acct_manufacturing_model,
+    acct_primary_site_function,
+    acct_tier_rollup,
+    title_seniority,
+    title_function,
+    has_quality,
+    has_manufacturing,
+    has_operations,
+    has_engineering,
+    has_regulatory,
+    has_vp,
+    has_director,
+    has_manager
+  ) %>%
+  drop_na()
+
+cat("Records available for modeling:", nrow(model_data), "\n")
+```
+
+---
+
+# Descriptive Analysis — Mx Baseline
+
+Before modeling I want to confirm the key patterns from my EDA hold in the cleaned dataset.
+
+```{r descriptive}
+mx_df <- model_data %>% filter(solution_rollup == "Mx")
+
+baseline_conv <- round(mean(mx_df$progressed == 1) * 100, 1)
+cat("Mx baseline conversion:", baseline_conv, "%\n")
+cat("Total Mx leads:", nrow(mx_df), "\n")
+
+# By manufacturing model
+mx_df %>%
+  group_by(acct_manufacturing_model) %>%
+  summarise(leads = n(), conversion = round(mean(progressed == 1) * 100, 1)) %>%
+  arrange(desc(conversion)) %>%
+  gt() %>%
+  tab_header(title = "Mx Conversion by Manufacturing Model")
+
+# By company tier
+mx_df %>%
+  group_by(acct_tier_rollup) %>%
+  summarise(leads = n(), conversion = round(mean(progressed == 1) * 100, 1)) %>%
+  arrange(desc(conversion)) %>%
+  gt() %>%
+  tab_header(title = "Mx Conversion by Company Tier")
+
+# By title seniority — visualized
+mx_df %>%
+  group_by(title_seniority) %>%
+  summarise(leads = n(), conversion = round(mean(progressed == 1) * 100, 1)) %>%
+  filter(leads >= 20) %>%
+  ggplot(aes(x = reorder(title_seniority, conversion), y = conversion, fill = conversion)) +
+  geom_col() +
+  geom_hline(yintercept = baseline_conv, linetype = "dashed", color = "red", linewidth = 0.8) +
+  geom_text(aes(label = paste0(conversion, "%")), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "#DCE6F1", high = "#1F4E79") +
+  labs(title = "Mx Conversion by Title Seniority",
+       subtitle = "Red line = Mx baseline",
+       x = NULL, y = "Conversion Rate (%)") +
+  theme(legend.position = "none")
+```
+
+**Notes:** The patterns hold. Manufacturing model and company tier are the strongest account signals. The Director finding is worth flagging — Directors convert below baseline at around 11-12% while Managers outperform at 14-15%. That's counterintuitive given Directors are more senior, but Director titles in this dataset skew heavily toward quality and compliance functions which are more naturally Qx buyer personas.
+
+---
+
+# Train / Test Split
+
+```{r split}
+mx_data <- model_data %>%
+  filter(solution_rollup == "Mx") %>%
+  select(-solution_rollup)
+
+split  <- initial_split(mx_data, prop = 0.70, strata = progressed)
+train  <- training(split)
+test   <- testing(split)
+
+cat("Training:", nrow(train), "| Testing:", nrow(test), "\n")
+```
+
+---
+
+# Modeling
+
+## Model 1: Logistic Regression (Primary Model)
+
+Logistic regression is the primary model. It outputs a probability score for each lead and the coefficients tell us exactly which variables increase or decrease conversion likelihood — that interpretability is what makes it practical for a sales targeting recommendation.
+
+This version includes the keyword flags alongside the categorical predictors, giving the model more granular title signal.
+
+```{r logistic}
+align_levels <- function(train_df, test_df) {
+  for (v in names(train_df)) {
+    if (is.factor(train_df[[v]])) {
+      test_df[[v]] <- factor(test_df[[v]], levels = levels(train_df[[v]]))
+    }
+  }
+  test_df %>% drop_na()
+}
+
+test_aligned <- align_levels(train, test)
+
+log_model <- glm(
+  progressed ~ acct_target_industry + acct_manufacturing_model +
+    acct_primary_site_function + acct_tier_rollup +
+    title_seniority + title_function +
+    has_quality + has_manufacturing + has_operations +
+    has_engineering + has_vp + has_director + has_manager,
+  data   = train,
+  family = binomial
+)
+
+# Predictions and threshold
+train$pred_prob         <- predict(log_model, newdata = train, type = "response")
+test_aligned$pred_prob  <- predict(log_model, newdata = test_aligned, type = "response")
+
+roc_train  <- roc(train$progressed, train$pred_prob, quiet = TRUE)
+threshold  <- as.numeric(coords(roc_train, "best", ret = "threshold"))
+
+test_aligned$pred_class <- factor(
+  ifelse(test_aligned$pred_prob >= threshold, 1, 0),
+  levels = c(0, 1)
+)
+
+roc_test <- roc(test_aligned$progressed, test_aligned$pred_prob, quiet = TRUE)
+
+tibble(
+  Metric = c("AUC", "Accuracy", "Precision", "Recall", "F1", "Threshold"),
+  Value  = c(
+    round(as.numeric(auc(roc_test)), 4),
+    round(accuracy_vec(test_aligned$progressed, test_aligned$pred_class), 4),
+    round(precision_vec(test_aligned$progressed, test_aligned$pred_class, event_level = "second"), 4),
+    round(recall_vec(test_aligned$progressed, test_aligned$pred_class, event_level = "second"), 4),
+    round(f_meas_vec(test_aligned$progressed, test_aligned$pred_class, event_level = "second"), 4),
+    round(threshold, 4)
+  )
+) %>%
+  gt() %>%
+  tab_header(title = "Logistic Regression — Performance Metrics")
+
+# ROC curve
+plot(roc_test, col = "#2C7FB8", lwd = 2,
+     main = paste("ROC Curve — Logistic Regression | AUC =",
+                  round(as.numeric(auc(roc_test)), 3)))
+abline(a = 0, b = 1, lty = 2)
+
+# Significant predictors
+broom::tidy(log_model, conf.int = TRUE) %>%
+  mutate(odds_ratio = exp(estimate)) %>%
+  filter(term != "(Intercept)", p.value < 0.10) %>%
+  arrange(p.value) %>%
+  select(Predictor = term, `Odds Ratio` = odds_ratio, `p-value` = p.value) %>%
+  gt() %>%
+  tab_header(title = "Logistic Regression — Significant Predictors") %>%
+  fmt_number(columns = c(`Odds Ratio`, `p-value`), decimals = 4)
+```
+
+## Model 2: Random Forest (Benchmark)
+
+Random forest as a benchmark — if it points to the same variables as logistic regression, that strengthens confidence in the findings.
+
+```{r random-forest}
+rf_model <- randomForest(
+  progressed ~ acct_target_industry + acct_manufacturing_model +
+    acct_primary_site_function + acct_tier_rollup +
+    title_seniority + title_function +
+    has_quality + has_manufacturing + has_operations +
+    has_engineering + has_vp + has_director + has_manager,
+  data       = train,
+  ntree      = 300,
+  mtry       = 4,
+  importance = TRUE,
+  classwt    = c("0" = 1, "1" = 4)
+)
+
+rf_prob      <- predict(rf_model, newdata = test_aligned, type = "prob")[, 2]
+roc_rf       <- roc(test_aligned$progressed, rf_prob, quiet = TRUE)
+roc_train_rf <- roc(train$progressed,
+  predict(rf_model, newdata = train, type = "prob")[, 2], quiet = TRUE)
+threshold_rf <- as.numeric(coords(roc_train_rf, "best", ret = "threshold"))
+rf_class     <- factor(ifelse(rf_prob >= threshold_rf, 1, 0), levels = c(0, 1))
+
+tibble(
+  Metric = c("AUC", "Accuracy", "Precision", "Recall", "F1"),
+  Value  = c(
+    round(as.numeric(auc(roc_rf)), 4),
+    round(accuracy_vec(test_aligned$progressed, rf_class), 4),
+    round(precision_vec(test_aligned$progressed, rf_class, event_level = "second"), 4),
+    round(recall_vec(test_aligned$progressed, rf_class, event_level = "second"), 4),
+    round(f_meas_vec(test_aligned$progressed, rf_class, event_level = "second"), 4)
+  )
+) %>%
+  gt() %>%
+  tab_header(title = "Random Forest — Performance Metrics")
+
+# Variable importance plot
+importance(rf_model) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(MeanDecreaseAccuracy)) %>%
+  head(12) %>%
+  ggplot(aes(x = reorder(Variable, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "#1F4E79") +
+  coord_flip() +
+  labs(title = "Variable Importance — Random Forest",
+       subtitle = "Top 12 predictors by Mean Decrease Accuracy",
+       x = "Predictor", y = "Importance")
+```
+
+**Notes:** If both models agree on the same top predictors — manufacturing model, site function, and certain title signals — that validates the findings are real and not model-specific artifacts.
+
+---
+
+# Mx Lead Prioritization Framework
+
+This is the core deliverable — translating the logistic regression model into a practical tool the sales team can use.
+
+The model assigns every Mx lead a probability score from 0 to 1 based on all variables simultaneously. I set thresholds to create three actionable tiers. The cutoffs were chosen so Tier 1 represents roughly the top 10% of the pipeline — a manageable call list for an SDR team.
+
+```{r tier-framework}
+all_mx <- model_data %>%
+  filter(solution_rollup == "Mx") %>%
+  select(-solution_rollup)
+
+for (v in names(log_model$xlevels)) {
+  all_mx[[v]] <- factor(all_mx[[v]], levels = log_model$xlevels[[v]])
+}
+
+all_mx <- all_mx %>% drop_na()
+all_mx$pred_prob <- predict(log_model, newdata = all_mx, type = "response")
+
+all_mx <- all_mx %>%
+  mutate(
+    priority_tier = case_when(
+      pred_prob >= 0.25 ~ "Tier 1 — High Priority",
+      pred_prob >= 0.15 ~ "Tier 2 — Medium Priority",
+      TRUE              ~ "Tier 3 — Low Priority"
+    )
+  )
+
+tier_summary <- all_mx %>%
+  group_by(priority_tier) %>%
+  summarise(
+    Lead_Count       = n(),
+    Conversion_Rate  = round(mean(progressed == 1) * 100, 1),
+    Pct_of_Pipeline  = round(n() / nrow(all_mx) * 100, 1),
+    Lift_vs_Baseline = round(mean(progressed == 1) * 100 -
+                              mean(all_mx$progressed == 1) * 100, 1),
+    .groups = "drop"
+  )
+
+tier_summary %>%
+  gt() %>%
+  tab_header(
+    title    = "Mx Lead Prioritization Framework",
+    subtitle = "Model-scored tiers showing conversion lift vs baseline"
+  )
+```
+
+```{r tier-visualization}
+# Tier conversion visualization
+tier_plot_data <- tier_summary %>%
+  mutate(priority_tier = factor(priority_tier,
+    levels = c("Tier 1 — High Priority",
+               "Tier 2 — Medium Priority",
+               "Tier 3 — Low Priority")))
+
+baseline_rate <- round(mean(all_mx$progressed == 1) * 100, 1)
+
+ggplot(tier_plot_data,
+       aes(x = priority_tier, y = Conversion_Rate, fill = priority_tier)) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = baseline_rate, linetype = "dashed",
+             color = "red", linewidth = 0.8) +
+  geom_text(aes(label = paste0(Conversion_Rate, "%\n(", Lead_Count, " leads)")),
+            vjust = -0.4, size = 4, fontface = "bold") +
+  annotate("text", x = 0.6, y = baseline_rate + 0.8,
+           label = paste0("Baseline: ", baseline_rate, "%"),
+           color = "red", size = 3.5, hjust = 0) +
+  scale_fill_manual(values = c(
+    "Tier 1 — High Priority"   = "#1F4E79",
+    "Tier 2 — Medium Priority" = "#2C7FB8",
+    "Tier 3 — Low Priority"    = "#DCE6F1"
+  )) +
+  labs(
+    title    = "Mx Lead Conversion Rate by Priority Tier",
+    subtitle = "Red dashed line = current Mx baseline",
+    x        = NULL,
+    y        = "Observed Conversion Rate (%)"
+  ) +
+  theme(legend.position = "none") +
+  ylim(0, max(tier_plot_data$Conversion_Rate) * 1.2)
+```
+
+```{r tier-profile}
+# Tier 1 profile
+all_mx %>%
+  filter(priority_tier == "Tier 1 — High Priority") %>%
+  summarise(
+    Top_Industry    = names(sort(table(acct_target_industry),    decreasing = TRUE))[1],
+    Top_Mfg_Model   = names(sort(table(acct_manufacturing_model), decreasing = TRUE))[1],
+    Top_Tier        = names(sort(table(acct_tier_rollup),        decreasing = TRUE))[1],
+    Top_Seniority   = names(sort(table(title_seniority),         decreasing = TRUE))[1],
+    Top_Function    = names(sort(table(title_function),          decreasing = TRUE))[1]
+  ) %>%
+  gt() %>%
+  tab_header(title = "Tier 1 Lead Profile — Most Common Characteristics")
+
+# Impact summary
+tier1_rate  <- tier_summary %>%
+  filter(priority_tier == "Tier 1 — High Priority") %>% pull(Conversion_Rate)
+tier1_count <- tier_summary %>%
+  filter(priority_tier == "Tier 1 — High Priority") %>% pull(Lead_Count)
+
+tibble(
+  Metric = c("Overall Mx Baseline", "Tier 1 Conversion Rate",
+             "Lift (pp)", "Tier 1 Lead Count", "Improvement Multiple"),
+  Value  = c(
+    paste0(baseline_rate, "%"),
+    paste0(tier1_rate, "%"),
+    paste0("+", tier1_rate - baseline_rate, " pp"),
+    as.character(tier1_count),
+    paste0(round(tier1_rate / baseline_rate, 1), "x")
+  )
+) %>%
+  gt() %>%
+  tab_header(title = "Estimated Impact of Tier 1 Targeting",
+             subtitle = "What MasterControl should prioritize going forward")
+```
+
+**Notes:** The conversion rates here are retrospective — they reflect what those leads actually did historically. The argument is that if those account and persona characteristics drove those rates in the past, targeting similar leads going forward should produce comparable results. A one-quarter pilot would confirm whether the lift holds on new unseen leads.
+
+65% of current Mx SDR effort is going to Tier 3 leads converting below baseline. Redirecting effort toward Tier 1 produces a meaningful improvement without generating any new leads.
+
+---
+
+# Cross-Sell Opportunities
+
+One additional finding worth highlighting — which contacts represent opportunities for both Mx and Qx.
+
+```{r cross-sell}
+# Cross-sell analysis by title function
+cross_sell <- model_data %>%
+  filter(solution_rollup %in% c("Mx", "Qx")) %>%
+  group_by(solution_rollup, title_function) %>%
+  summarise(
+    leads      = n(),
+    conversion = round(mean(progressed == 1) * 100, 1),
+    .groups    = "drop"
+  ) %>%
+  pivot_wider(
+    names_from  = solution_rollup,
+    values_from = c(leads, conversion)
+  ) %>%
+  mutate(
+    cross_sell_flag = case_when(
+      conversion_Mx > 13.5 & conversion_Qx > 19.0 ~ "High Cross-Sell Potential",
+      TRUE ~ "Lower Cross-Sell Potential"
+    )
+  ) %>%
+  arrange(desc(conversion_Mx))
+
+cross_sell %>%
+  select(title_function, conversion_Mx, conversion_Qx, cross_sell_flag) %>%
+  gt() %>%
+  tab_header(
+    title    = "Cross-Sell Opportunities by Title Function",
+    subtitle = "Segments converting above baseline for both Mx and Qx"
+  ) %>%
+  fmt_number(columns = c(conversion_Mx, conversion_Qx), decimals = 1)
+
+# Visualize Mx vs Qx by title function
+model_data %>%
+  filter(solution_rollup %in% c("Mx", "Qx")) %>%
+  group_by(solution_rollup, title_function) %>%
+  summarise(conversion = round(mean(progressed == 1) * 100, 1),
+            leads = n(), .groups = "drop") %>%
+  filter(leads >= 30) %>%
+  ggplot(aes(x = reorder(title_function, conversion),
+             y = conversion, fill = solution_rollup)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Mx" = "#1F4E79", "Qx" = "#E07B39")) +
+  labs(title = "Conversion by Title Function — Mx vs Qx",
+       subtitle = "Quality/Compliance converting well for Mx = cross-sell signal",
+       x = NULL, y = "Conversion Rate (%)", fill = "Product")
+```
+
+**Notes:** Quality/Compliance roles converting at around 15% for Mx is one of the more interesting findings. These contacts are likely already familiar with MasterControl through Qx — making them a natural bridge to Mx adoption rather than a cold outreach target. The strongest pure Mx function is Engineering/R&D. Regulatory is the weakest for both products.
+
+---
+
+# Key Findings and Recommendations
+
+## What the Models Agree On
+
+Both logistic regression and random forest pointed to the same key drivers.
+
+- **Manufacturing model** is the single strongest predictor — how a company manufactures matters more than what industry it's in
+- **Small companies** outperform Large — the data says focus here despite intuition suggesting enterprise accounts
+- **Directors underperform Managers** — Director titles skew toward quality and compliance functions in this dataset, which are more naturally Qx personas
+- **Services and software organizations** convert below 7% — less than half the baseline
+- **Quality/Compliance contacts** at manufacturing companies are cross-sell opportunities, not cold Mx targets
+
+## Recommendations
+
+**For SDRs:** Work Tier 1 first. Focus on small Pharma and BioTech companies with in-house or CMO/CDMO manufacturing and Manager level contacts in Engineering roles. Pull back on services and software entirely.
+
+**For sales leadership:** Implement the tier scoring model in CRM. Encode the logistic regression coefficients so every new Mx lead gets auto-scored as it enters the pipeline. Run a one-quarter pilot on Tier 1, validate the lift holds on new leads, then scale.
+
+**For future modeling:** Retrain every 6-12 months as new lead data accumulates. The same framework can be extended to Qx leads and cross-sell scoring for existing customers.
+
+---
+
+# AI Usage Log
+
+AI tools were used to support code debugging, structure review, and documentation. All modeling decisions, findings, and recommendations reflect my own analysis and interpretation of the results.
