@@ -1,9 +1,7 @@
-# MasterControl-Sales-Analytics
-Sales lead analysis and predictive modeling for MasterControl's Mx product line
 # MasterControl Sales Analytics — Mx Lead Targeting
 
 **Author:** Rob Sheehy | MSBA Capstone Group 5
-**Tools:** R, tidyverse, ggplot2, logistic regression, random forest, XGBoost
+**Tools:** R, tidyverse, ggplot2, logistic regression, random forest
 
 ---
 
@@ -24,23 +22,32 @@ Key things I found:
 - Small companies convert best for Mx at 15.6% while Large companies are only at 5.5% — the opposite of what I expected
 - Medical Device + Small + Mx converts at 20.3% and Pharma + Small + Mx at 19.0% — both well above the 12.7% baseline
 - Quality titles dominate the dataset (3,096 occurrences vs 477 manufacturing titles) — MasterControl is reaching Quality personas who care about QMS, not Manufacturing personas who need MES. That's a core part of why Mx underperforms
-- 40.9% of manufacturing model and site function data was missing — flagged this throughout as a key limitation
+- 40.9% of manufacturing model and site function data was missing — flagged throughout as a key limitation
 
 ---
 
-## Group Modeling (`Modeling_Mastercontrol_Group_5_Final.Rmd`)
+## My Individual Modeling (`MasterControl_Modeling_Rob.Rmd`)
 
-Group modeling notebook combining work from all team members. My contributions include the Mx Lead Prioritization Framework (tier scoring system) and portions of the executive analysis and deliverable sections.
+Built my own modeling notebook focused on predicting which Mx leads are most likely to convert and translating that into a practical sales targeting framework.
 
-The team built five models — Logistic Regression, Elastic-Net, Decision Tree, Random Forest, and XGBoost. My contribution was the Mx Lead Prioritization Framework which used the combined logistic regression model to score every Mx lead with a predicted conversion probability and bucket them into three tiers:
+**What I built:**
+
+- Rule-based title classification system converting 6,400+ unique job titles into seniority and functional role categories, plus binary keyword flags for overlapping title signals
+- Logistic Regression as the primary model — selected for interpretability so the sales team can understand why each lead is prioritized
+- Random Forest as a benchmark to validate the same variables dominate across approaches
+- AUC of 0.663 — solid for sales conversion data with significant class imbalance and missing values
+
+**Mx Lead Prioritization Framework — core deliverable:**
+
+Used the logistic model to score every Mx lead with a predicted conversion probability, then bucketed them into three tiers:
 
 | Tier | Leads | Conversion Rate | vs Baseline |
 |------|-------|----------------|-------------|
-| Tier 1 (score ≥ 0.25) | 310 | 32.9% | +19.4pp |
-| Tier 2 (score 0.15–0.25) | 783 | 17.0% | +3.5pp |
-| Tier 3 (score < 0.15) | 2,051 | 9.2% | -4.3pp |
+| Tier 1 (score ≥ 0.25) | 295 | 33.2% | +19.8pp |
+| Tier 2 (score 0.15–0.25) | 762 | 16.9% | +3.5pp |
+| Tier 3 (score < 0.15) | 2,092 | 9.4% | -4.1pp |
 
-Tier 1 profile: Small Pharma & BioTech, in-house manufacturing, Manager level contacts. 65% of current Mx SDR effort is going to Tier 3 leads converting below baseline. Redirecting effort toward Tier 1 produces a nearly 2.5x improvement without generating any new leads.
+Tier 1 profile: Small Pharma & BioTech, in-house manufacturing, Manager level contacts. 66% of current Mx SDR effort is going to Tier 3 leads converting below baseline. Redirecting effort toward Tier 1 produces a 2.5x improvement without generating any new leads.
 
 ---
 
@@ -57,9 +64,9 @@ Tier 1 profile: Small Pharma & BioTech, in-house manufacturing, Manager level co
 
 | File | Description |
 |------|-------------|
-| `MasterControl_EDA_Rob.Rmd` | My individual EDA notebook |
+| `MasterControl_EDA_Rob.Rmd` | Individual EDA notebook |
 | `MasterControl_EDA_Rob.html` | Rendered EDA output |
-| `Modeling_Mastercontrol_Group_5_Final.Rmd` | Group modeling notebook |
-| `Modeling_Mastercontrol_Group_5_Final.html` | Rendered modeling output |
+| `MasterControl_Modeling_Rob.Rmd` | Individual modeling notebook |
+| `MasterControl_Modeling_Rob.html` | Rendered modeling output |
 
 *Note: Project data not included per course policy.*
